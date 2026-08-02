@@ -76,6 +76,8 @@ ST_RENAME = "将重命名"
 ST_NOCHANGE = "无变化"
 ST_CONFLICT = "冲突-跳过"
 ST_DUP = "重复-跳过"
+ST_DONE = "✓ 已改"
+ST_FAIL = "✗ 失败"
 
 UNDO_FILE = os.path.join(os.path.expanduser("~"), ".batch_rename_undo.json")
 
@@ -527,6 +529,7 @@ class App(_BaseTk):
         self._busy = False
         self._build_ui()
         self._apply_config()
+        self._refresh_sample()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _apply_config(self):
@@ -622,6 +625,10 @@ class App(_BaseTk):
         self._build_tab_edit()
         self._build_tab_ext()
 
+        # 实时示例：不依赖真实选择，用固定样例展示当前规则效果
+        self.sample_lbl = ttk.Label(mid, text="", foreground="#0a6")
+        self.sample_lbl.pack(anchor="w", padx=8, pady=(0, 4))
+
         # 操作按钮
         ops = ttk.Frame(self)
         ops.pack(fill="x", **pad)
@@ -631,25 +638,39 @@ class App(_BaseTk):
         ttk.Button(ops, text="撤销上一次", command=self._undo).pack(side="left", padx=3)
         self.realtime_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(ops, text="实时预览", variable=self.realtime_var).pack(side="left", padx=8)
+        self.only_changed_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ops, text="只看会改的", variable=self.only_changed_var,
+                        command=self._render_plan).pack(side="left", padx=8)
         self.status_lbl = ttk.Label(ops, text="")
         self.status_lbl.pack(side="left", padx=12)
 
         # 预览表
         table = ttk.LabelFrame(self, text="3. 预览（双击「新名」可手动编辑；执行前请核对）")
         table.pack(fill="both", expand=True, **pad)
+        srow = ttk.Frame(table)
+        srow.pack(fill="x", padx=6, pady=2)
+        ttk.Label(srow, text="搜索:").pack(side="left")
+        self.search_var = tk.StringVar()
+        ttk.Entry(srow, textvariable=self.search_var, width=24).pack(side="left", padx=4)
+        self.search_var.trace_add("write", lambda *a: self._render_plan())
+        ttk.Label(srow, text="（匹配原名或新名）", foreground="#888").pack(side="left")
+        twrap = ttk.Frame(table)
+        twrap.pack(fill="both", expand=True)
         cols = ("old_name", "new_name", "status", "old_path")
-        self.tree = ttk.Treeview(table, columns=cols, show="headings")
+        self.tree = ttk.Treeview(twrap, columns=cols, show="headings")
         for c, txt, w in [("old_name", "原名", 200), ("new_name", "新名", 200),
                           ("status", "状态", 90), ("old_path", "路径", 340)]:
             self.tree.heading(c, text=txt)
             self.tree.column(c, width=w, anchor="w")
-        vsb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        vsb = ttk.Scrollbar(twrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self.tree.tag_configure("rename", foreground="#158000")
         self.tree.tag_configure("nochange", foreground="#888888")
         self.tree.tag_configure("skip", foreground="#c00000")
+        self.tree.tag_configure("done", foreground="#0a6")
+        self.tree.tag_configure("fail", foreground="#c00000")
         # iid -> plan 中的索引，供双击编辑定位
         self._row_index = {}
         self.tree.bind("<Double-1>", self._on_row_dblclick)
@@ -853,12 +874,28 @@ class App(_BaseTk):
         return mode, p
 
     def _schedule_preview(self):
-        """参数变化时触发（带防抖）。实时预览关闭则不动。"""
+        """参数变化时触发。示例即时刷新；实时预览开则防抖刷新表格。"""
+        self._refresh_sample()
         if not getattr(self, "realtime_var", None) or not self.realtime_var.get():
             return
         if self._preview_job:
             self.after_cancel(self._preview_job)
         self._preview_job = self.after(DEBOUNCE_MS, self._preview)
+
+    def _refresh_sample(self):
+        """用固定样例展示当前规则效果，不依赖真实选择。"""
+        if not hasattr(self, "sample_lbl"):
+            return
+        mode, params = self._current_params()
+        sample = "sample.jpg"
+        try:
+            # 序号示例给个组内序号 1，父目录名用 folder 演示
+            result = compute_new_name(sample, True, mode, params, index=1, parent_name="folder")
+            self.sample_lbl.config(text=f"示例：{sample} → {result}", foreground="#0a6")
+        except re.error as e:
+            self.sample_lbl.config(text=f"示例：正则非法（{e}）", foreground="#c00")
+        except Exception:
+            self.sample_lbl.config(text="")
 
     def _preview(self):
         self._preview_job = None
@@ -898,32 +935,57 @@ class App(_BaseTk):
         self.plan = plan
         self._render_plan()
 
+    @staticmethod
+    def _status_tag(status):
+        return {ST_RENAME: "rename", ST_NOCHANGE: "nochange",
+                ST_CONFLICT: "skip", ST_DUP: "skip",
+                ST_DONE: "done", ST_FAIL: "fail"}.get(status, "nochange")
+
+    def _visible_indices(self):
+        """按「只看会改的」+ 搜索词过滤，返回要显示的 plan 索引列表。"""
+        only = self.only_changed_var.get()
+        kw = self.search_var.get().strip().lower()
+        out = []
+        for i, p in enumerate(self.plan):
+            if only and p["status"] not in (ST_RENAME, ST_DONE):
+                continue
+            if kw and kw not in p["old_name"].lower() and kw not in p["new_name"].lower():
+                continue
+            out.append(i)
+        return out
+
     def _render_plan(self):
+        # 打断上一次未完成的分批渲染
+        self._render_seq = getattr(self, "_render_seq", 0) + 1
         self.tree.delete(*self.tree.get_children())
         self._row_index.clear()
-        counts = {ST_RENAME: 0, ST_NOCHANGE: 0, ST_CONFLICT: 0, ST_DUP: 0}
+        counts = {}
         for p in self.plan:
-            counts[p["status"]] += 1
-        self._render_batch(0)
-        extra = f" | 仅显示前 {RENDER_LIMIT} 行" if len(self.plan) > RENDER_LIMIT else ""
+            counts[p["status"]] = counts.get(p["status"], 0) + 1
+        self._visible = self._visible_indices()
+        self._render_batch(0, self._render_seq)
+        shown = len(self._visible)
+        capped = f"（仅显示前 {RENDER_LIMIT}）" if shown > RENDER_LIMIT else ""
+        parts = [f"{k} {v}" for k, v in counts.items()]
         self.status_lbl.config(
-            text=f"共 {len(self.plan)} 项 | 将改 {counts[ST_RENAME]} | 无变化 {counts[ST_NOCHANGE]} | "
-                 f"冲突 {counts[ST_CONFLICT]} | 重复 {counts[ST_DUP]}{extra}"
+            text=f"共 {len(self.plan)} 项 | 显示 {min(shown, RENDER_LIMIT)}{capped} | " + " | ".join(parts)
         )
 
-    def _render_batch(self, start):
-        """分批插入，每批 500 行，避免一次性插入大量行卡界面。start 为 plan 索引。"""
-        tag_map = {ST_RENAME: "rename", ST_NOCHANGE: "nochange",
-                   ST_CONFLICT: "skip", ST_DUP: "skip"}
-        end = min(start + 500, len(self.plan), RENDER_LIMIT)
-        for i in range(start, end):
+    def _render_batch(self, start, seq):
+        """分批插入，每批 500 行。seq 过期则停止（有更新的渲染）。"""
+        if seq != self._render_seq:
+            return
+        vis = self._visible
+        end = min(start + 500, len(vis), RENDER_LIMIT)
+        for k in range(start, end):
+            i = vis[k]
             p = self.plan[i]
             iid = self.tree.insert("", "end",
                                    values=(p["old_name"], p["new_name"], p["status"], p["old_path"]),
-                                   tags=(tag_map[p["status"]],))
+                                   tags=(self._status_tag(p["status"]),))
             self._row_index[iid] = i
-        if end < min(len(self.plan), RENDER_LIMIT):
-            self.after(1, lambda: self._render_batch(end))
+        if end < min(len(vis), RENDER_LIMIT):
+            self.after(1, lambda: self._render_batch(end, seq))
 
     def _on_row_dblclick(self, event):
         """双击某行手动编辑「新名」。改后重算该行状态。"""
@@ -948,30 +1010,36 @@ class App(_BaseTk):
             p["status"] = ST_CONFLICT
         else:
             p["status"] = ST_RENAME
-        tag_map = {ST_RENAME: "rename", ST_NOCHANGE: "nochange",
-                   ST_CONFLICT: "skip", ST_DUP: "skip"}
         self.tree.item(iid, values=(p["old_name"], p["new_name"], p["status"], p["old_path"]),
-                       tags=(tag_map[p["status"]],))
+                       tags=(self._status_tag(p["status"]),))
 
     def _execute(self):
         if not self.plan:
             messagebox.showwarning("提示", "请先点「预览」生成计划")
             return
-        will = sum(1 for p in self.plan if p["status"] == ST_RENAME)
-        if will == 0:
+        to_do = [p for p in self.plan if p["status"] == ST_RENAME]
+        if not to_do:
             messagebox.showinfo("提示", "没有需要重命名的项")
             return
-        if not messagebox.askyesno("确认", f"确定重命名 {will} 项？此操作可撤销。"):
+        if not messagebox.askyesno("确认", f"确定重命名 {len(to_do)} 项？此操作可撤销。"):
             return
+        # 记录哪些计划项真正成功了：执行后按 new_path 是否落地判断
         try:
             done, skipped, _ = execute_plan(self.plan)
         except Exception:
             messagebox.showerror("执行出错", traceback.format_exc())
             return
-        messagebox.showinfo("完成", f"成功 {done} 项，跳过 {skipped} 项。")
-        self.plan = []
-        self.tree.delete(*self.tree.get_children())
-        self.status_lbl.config(text=f"已执行：成功 {done}，跳过 {skipped}。可点「撤销上一次」恢复。")
+        # 保留结果：成功项标 ✓ 已改，并把原名/路径更新为新状态；未落地的标 ✗ 失败
+        for p in to_do:
+            if os.path.exists(p["new_path"]) and not os.path.exists(p["old_path"]):
+                p["status"] = ST_DONE
+                p["old_name"] = p["new_name"]
+                p["old_path"] = p["new_path"]
+            else:
+                p["status"] = ST_FAIL
+        self._render_plan()
+        messagebox.showinfo("完成", f"成功 {done} 项，跳过 {skipped} 项。结果已在表中标记，可「撤销上一次」恢复。")
+        self.status_lbl.config(text=f"已执行：成功 {done}，跳过 {skipped}。绿色 ✓ 为已改，可撤销。")
 
     def _undo(self):
         restored, failed = undo_last()
