@@ -46,6 +46,31 @@ POS_PREFIX = "原名前"
 POS_REPLACE = "替换原名"
 POS_OPTIONS = [POS_SUFFIX, POS_PREFIX, POS_REPLACE]
 
+# 序号样式
+SEQ_NUMBER = "数字 1,2,3"
+SEQ_LOWER = "小写字母 a,b,c"
+SEQ_UPPER = "大写字母 A,B,C"
+SEQ_OPTIONS = [SEQ_NUMBER, SEQ_LOWER, SEQ_UPPER]
+
+CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".batch_rename_config.json")
+
+
+def natural_key(name):
+    """自然排序键：把数字段当整数比较，使 file2 排在 file10 前。"""
+    parts = re.split(r"(\d+)", name.lower())
+    return [int(p) if p.isdigit() else p for p in parts]
+
+
+def index_to_letters(n):
+    """1→a, 2→b, ..., 26→z, 27→aa（Excel 列式）。n<1 返回空。"""
+    if n < 1:
+        return ""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(ord("a") + r) + s
+    return s
+
 # 预览状态
 ST_RENAME = "将重命名"
 ST_NOCHANGE = "无变化"
@@ -136,10 +161,17 @@ def apply_replace(stem, rule, find, repl, case_sensitive):
 def apply_number(stem, index, opts, parent_name):
     """序号模式。index 为组内序号（已含起始值+步长计算后的值）。
 
-    opts: dict(pad, prefix, suffix, position, use_parent, sep)
+    opts: dict(pad, prefix, suffix, position, use_parent, sep, style)
+    style: SEQ_NUMBER/SEQ_LOWER/SEQ_UPPER。字母样式忽略补零。
     use_parent 时用 parent_name 作为序号前缀（如父文件夹 '1' → '1-001'）。
     """
-    num = str(index).zfill(opts.get("pad", 0))
+    style = opts.get("style", SEQ_NUMBER)
+    if style == SEQ_LOWER:
+        num = index_to_letters(index)
+    elif style == SEQ_UPPER:
+        num = index_to_letters(index).upper()
+    else:
+        num = str(index).zfill(opts.get("pad", 0))
     seq = num
     if opts.get("use_parent") and parent_name:
         seq = f"{parent_name}{opts.get('sep', '-')}{num}"
@@ -245,33 +277,41 @@ def build_plan(targets, mode, params, filter_glob=""):
         for path, _ in targets:
             groups.setdefault(os.path.dirname(path), []).append(path)
         for parent, paths in groups.items():
-            paths.sort(key=lambda p: os.path.basename(p).lower())
+            paths.sort(key=lambda p: natural_key(os.path.basename(p)))
             for i, p in enumerate(paths):
                 index_map[p] = start + i * step
 
-    plan = []
-    target_seen = {}  # new_path(归一) -> True，本批次内重复判定
-
+    # 第一趟：算新名。会被腾空的源集合（真改名的旧路径）用于放宽冲突判定：
+    # 目标虽已存在，但若它是本批次某个将被改走的源，则不算真冲突（交换/循环改名）。
+    rows = []
+    vacated = set()  # 会被腾空的旧路径（归一）
     for old_path, is_dir in targets:
         old_name = os.path.basename(old_path)
         parent = os.path.dirname(old_path)
         parent_name = os.path.basename(parent)
-
         new_name = compute_new_name(
             old_name, not is_dir, mode, params,
             index=index_map.get(old_path, 0), parent_name=parent_name,
         )
-
         new_path = os.path.join(parent, new_name)
-        status = ST_RENAME
+        rows.append((old_path, new_name, old_name, new_path))
+        if new_name and new_name != old_name:
+            vacated.add(os.path.normcase(old_path))
 
-        if new_name == old_name or not new_name:
+    plan = []
+    target_seen = {}  # new_path(归一) -> True，本批次内重复判定
+    for old_path, new_name, old_name, new_path in rows:
+        status = ST_RENAME
+        if not new_name or new_name == old_name:
             status = ST_NOCHANGE
         else:
             key = os.path.normcase(new_path)
             if key in target_seen:
                 status = ST_DUP
-            elif os.path.exists(new_path) and os.path.normcase(new_path) != os.path.normcase(old_path):
+            elif (os.path.exists(new_path)
+                  and key != os.path.normcase(old_path)
+                  and key not in vacated):
+                # 已存在且不是本批次会被腾走的源 → 真冲突
                 status = ST_CONFLICT
             else:
                 target_seen[key] = True
@@ -287,41 +327,72 @@ def build_plan(targets, mode, params, filter_glob=""):
     return plan
 
 
+def _unique_temp(path):
+    """在同目录生成一个不存在的临时名。"""
+    base = path + ".brtmp"
+    cand = base
+    i = 0
+    while os.path.exists(cand):
+        i += 1
+        cand = f"{base}{i}"
+    return cand
+
+
 def execute_plan(plan):
-    """执行计划。叶子优先（路径深度深→浅）落盘，避免父目录改名后子项路径失效。
+    """执行计划。叶子优先（深→浅）落盘；同目录交换/循环改名用临时名破环。
 
     返回 (done_count, skipped_count, undo_records)
-    undo_records: [(new_path, old_path), ...] 按执行顺序。
+    undo_records: [(new_path, old_path), ...] 按执行顺序（含临时步骤）。
     """
     to_do = [p for p in plan if p["status"] == ST_RENAME]
-    # 叶子优先：路径分隔符越多越深，先改深的
+    # 叶子优先：路径越深越先改。始终从列表最前的空闲项执行，保证深项优先。
     to_do.sort(key=lambda p: p["old_path"].count(os.sep), reverse=True)
+    pending = [(p["old_path"], p["new_path"]) for p in to_do]
 
     done = 0
     skipped = 0
     undo = []
-    for p in to_do:
+
+    def is_free(old, new):
+        nc_new = os.path.normcase(new)
+        return nc_new == os.path.normcase(old) or not os.path.exists(new)
+
+    while pending:
+        idx = next((k for k, (o, n) in enumerate(pending) if is_free(o, n)), None)
+        if idx is None:
+            # 剩余项互相占用（循环），把最前一项挪到临时名以破环
+            old, new = pending[0]
+            temp = _unique_temp(old)
+            try:
+                os.rename(old, temp)
+                undo.append((temp, old))
+                pending[0] = (temp, new)
+            except OSError:
+                skipped += 1
+                pending.pop(0)
+            continue
+        old, new = pending.pop(idx)
         try:
-            os.rename(p["old_path"], p["new_path"])
-            undo.append((p["new_path"], p["old_path"]))
+            os.rename(old, new)
+            undo.append((new, old))
             done += 1
         except OSError:
             skipped += 1
 
     if undo:
-        _save_undo(undo)
+        _push_undo(undo)
     return done, skipped, undo
 
 
 def undo_last():
-    """恢复上一次重命名。按逆序（浅→深）改回原名。
+    """恢复最近一次重命名（弹出撤销栈顶）。逆序改回。
 
     返回 (restored_count, failed_count)；无记录返回 (0, 0)。
     """
-    records = _load_undo()
-    if not records:
+    stack = _load_stack()
+    if not stack:
         return 0, 0
-    # 执行时是深→浅，撤销要浅→深，逆序即可
+    records = stack.pop()
     restored = 0
     failed = 0
     for new_path, old_path in reversed(records):
@@ -331,30 +402,63 @@ def undo_last():
                 restored += 1
         except OSError:
             failed += 1
-    _clear_undo()
+    _save_stack(stack)
     return restored, failed
 
 
-def _save_undo(records):
+def undo_depth():
+    """撤销栈里还有多少批可撤。"""
+    return len(_load_stack())
+
+
+def _push_undo(records):
+    stack = _load_stack()
+    stack.append(records)
+    # 最多保留 20 批，防止无限增长
+    if len(stack) > 20:
+        stack = stack[-20:]
+    _save_stack(stack)
+
+
+def _load_stack():
+    """读撤销栈。兼容旧的扁平格式（单批 [[new,old],...]）。"""
     try:
+        with open(UNDO_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not data:
+        return []
+    # 旧格式：元素是 [new, old] 的二元列表 → 包成单批
+    if isinstance(data[0], list) and len(data[0]) == 2 and isinstance(data[0][0], str):
+        return [data]
+    return data
+
+
+def _save_stack(stack):
+    try:
+        if not stack:
+            if os.path.exists(UNDO_FILE):
+                os.remove(UNDO_FILE)
+            return
         with open(UNDO_FILE, "w", encoding="utf-8") as f:
-            json.dump(records, f, ensure_ascii=False)
+            json.dump(stack, f, ensure_ascii=False)
     except OSError:
         pass
 
 
-def _load_undo():
+def load_config():
     try:
-        with open(UNDO_FILE, "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
-        return []
+        return {}
 
 
-def _clear_undo():
+def save_config(cfg):
     try:
-        if os.path.exists(UNDO_FILE):
-            os.remove(UNDO_FILE)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
     except OSError:
         pass
 
@@ -414,13 +518,45 @@ class App(_BaseTk):
     def __init__(self):
         super().__init__()
         self.title("批量重命名工具")
-        self.geometry("900x720")
+        self._cfg = load_config()
+        self.geometry(self._cfg.get("geometry", "900x720"))
         self.roots = []          # 用户选择/拖入的顶层路径
         self.plan = []           # 当前预览计划
         self._preview_job = None  # 防抖 after id
         self._compute_seq = 0     # 后台计算序号，丢弃过期结果
         self._busy = False
         self._build_ui()
+        self._apply_config()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _apply_config(self):
+        """把上次保存的常用设置恢复到界面。"""
+        c = self._cfg
+        try:
+            if "scope" in c: self.scope_var.set(c["scope"])
+            if "recursive" in c: self.recursive_var.set(c["recursive"])
+            if "filter" in c: self.filter_var.set(c["filter"])
+            if "realtime" in c: self.realtime_var.set(c["realtime"])
+            if "keep_ext" in c: self.keep_ext_var.set(c["keep_ext"])
+            if "mode_tab" in c and 0 <= c["mode_tab"] < len(MODE_OPTIONS):
+                self.nb.select(c["mode_tab"])
+        except (tk.TclError, KeyError):
+            pass
+
+    def _on_close(self):
+        try:
+            save_config({
+                "geometry": self.winfo_geometry(),
+                "scope": self.scope_var.get(),
+                "recursive": self.recursive_var.get(),
+                "filter": self.filter_var.get(),
+                "realtime": self.realtime_var.get(),
+                "keep_ext": self.keep_ext_var.get(),
+                "mode_tab": self.nb.index(self.nb.select()),
+            })
+        except tk.TclError:
+            pass
+        self.destroy()
 
     # -- UI 装配 ------------------------------------------------------------
     def _build_ui(self):
@@ -442,14 +578,16 @@ class App(_BaseTk):
 
         srcwrap = ttk.Frame(top)
         srcwrap.pack(fill="x", padx=6, pady=4)
-        self.src = ttk.Treeview(srcwrap, show="tree", height=8, selectmode="none")
+        self.src = ttk.Treeview(srcwrap, show="tree", height=8, selectmode="browse")
         svsb = ttk.Scrollbar(srcwrap, orient="vertical", command=self.src.yview)
         self.src.configure(yscrollcommand=svsb.set)
         self.src.pack(side="left", fill="both", expand=True)
         svsb.pack(side="right", fill="y")
         # iid -> 绝对路径；用于懒加载时定位
         self._node_path = {}
+        self._root_iids = set()  # 顶层根节点 iid，仅这些可右键移除
         self.src.bind("<<TreeviewOpen>>", self._on_expand)
+        self.src.bind("<Button-3>", self._on_src_rclick)
         if _DND_OK:
             self.src.drop_target_register(DND_FILES)
             self.src.dnd_bind("<<Drop>>", self._on_drop)
@@ -497,7 +635,7 @@ class App(_BaseTk):
         self.status_lbl.pack(side="left", padx=12)
 
         # 预览表
-        table = ttk.LabelFrame(self, text="3. 预览（执行前请核对）")
+        table = ttk.LabelFrame(self, text="3. 预览（双击「新名」可手动编辑；执行前请核对）")
         table.pack(fill="both", expand=True, **pad)
         cols = ("old_name", "new_name", "status", "old_path")
         self.tree = ttk.Treeview(table, columns=cols, show="headings")
@@ -512,6 +650,9 @@ class App(_BaseTk):
         self.tree.tag_configure("rename", foreground="#158000")
         self.tree.tag_configure("nochange", foreground="#888888")
         self.tree.tag_configure("skip", foreground="#c00000")
+        # iid -> plan 中的索引，供双击编辑定位
+        self._row_index = {}
+        self.tree.bind("<Double-1>", self._on_row_dblclick)
 
     # -- 模式标签页 ---------------------------------------------------------
     def _watch(self, var):
@@ -551,6 +692,10 @@ class App(_BaseTk):
         ttk.Label(r1, text="补零位数:").pack(side="left")
         self.num_pad = self._watch(tk.IntVar(value=3))
         ttk.Spinbox(r1, from_=0, to=10, textvariable=self.num_pad, width=4).pack(side="left", padx=4)
+        ttk.Label(r1, text="样式:").pack(side="left", padx=(10, 0))
+        self.num_style = self._watch(tk.StringVar(value=SEQ_NUMBER))
+        ttk.Combobox(r1, textvariable=self.num_style, values=SEQ_OPTIONS,
+                     state="readonly", width=14).pack(side="left", padx=4)
         r2 = ttk.Frame(f); r2.pack(fill="x", padx=6, pady=4)
         self.num_use_parent = self._watch(tk.BooleanVar(value=True))
         ttk.Checkbutton(r2, text="用父文件夹名作前缀", variable=self.num_use_parent).pack(side="left")
@@ -610,8 +755,10 @@ class App(_BaseTk):
     def _refresh_drop(self):
         self.src.delete(*self.src.get_children())
         self._node_path.clear()
+        self._root_iids.clear()
         for r in self.roots:
-            self._insert_node("", r, top=True)
+            iid = self._insert_node("", r, top=True)
+            self._root_iids.add(iid)
 
     def _insert_node(self, parent_iid, path, top=False):
         """插入一个节点。目录默认折叠，先放占位子节点以显示展开箭头。"""
@@ -638,7 +785,7 @@ class App(_BaseTk):
         self.src.delete(*children)
         try:
             entries = sorted(os.listdir(path),
-                             key=lambda n: (not os.path.isdir(os.path.join(path, n)), n.lower()))
+                             key=lambda n: (not os.path.isdir(os.path.join(path, n)), natural_key(n)))
         except OSError:
             return
         for n in entries:
@@ -694,7 +841,8 @@ class App(_BaseTk):
             p = {"start": iv(self.num_start, 1), "step": iv(self.num_step, 1),
                  "pad": iv(self.num_pad, 0), "use_parent": self.num_use_parent.get(),
                  "sep": self.num_sep.get(), "prefix": self.num_prefix.get(),
-                 "suffix": self.num_suffix.get(), "position": self.num_pos.get()}
+                 "suffix": self.num_suffix.get(), "position": self.num_pos.get(),
+                 "style": self.num_style.get()}
         elif mode == MODE_CASE:
             p = {"case_mode": self.case_mode.get()}
         elif mode == MODE_EDIT:
@@ -752,28 +900,58 @@ class App(_BaseTk):
 
     def _render_plan(self):
         self.tree.delete(*self.tree.get_children())
+        self._row_index.clear()
         counts = {ST_RENAME: 0, ST_NOCHANGE: 0, ST_CONFLICT: 0, ST_DUP: 0}
         for p in self.plan:
             counts[p["status"]] += 1
-        shown = self.plan[:RENDER_LIMIT]
-        self._render_batch(shown, 0)
+        self._render_batch(0)
         extra = f" | 仅显示前 {RENDER_LIMIT} 行" if len(self.plan) > RENDER_LIMIT else ""
         self.status_lbl.config(
             text=f"共 {len(self.plan)} 项 | 将改 {counts[ST_RENAME]} | 无变化 {counts[ST_NOCHANGE]} | "
                  f"冲突 {counts[ST_CONFLICT]} | 重复 {counts[ST_DUP]}{extra}"
         )
 
-    def _render_batch(self, items, start):
-        """分批插入，每批 500 行，避免一次性插入大量行卡界面。"""
+    def _render_batch(self, start):
+        """分批插入，每批 500 行，避免一次性插入大量行卡界面。start 为 plan 索引。"""
         tag_map = {ST_RENAME: "rename", ST_NOCHANGE: "nochange",
                    ST_CONFLICT: "skip", ST_DUP: "skip"}
-        end = min(start + 500, len(items))
-        for p in items[start:end]:
-            self.tree.insert("", "end",
-                             values=(p["old_name"], p["new_name"], p["status"], p["old_path"]),
-                             tags=(tag_map[p["status"]],))
-        if end < len(items):
-            self.after(1, lambda: self._render_batch(items, end))
+        end = min(start + 500, len(self.plan), RENDER_LIMIT)
+        for i in range(start, end):
+            p = self.plan[i]
+            iid = self.tree.insert("", "end",
+                                   values=(p["old_name"], p["new_name"], p["status"], p["old_path"]),
+                                   tags=(tag_map[p["status"]],))
+            self._row_index[iid] = i
+        if end < min(len(self.plan), RENDER_LIMIT):
+            self.after(1, lambda: self._render_batch(end))
+
+    def _on_row_dblclick(self, event):
+        """双击某行手动编辑「新名」。改后重算该行状态。"""
+        if self.tree.identify("region", event.x, event.y) != "cell":
+            return
+        iid = self.tree.identify_row(event.y)
+        i = self._row_index.get(iid)
+        if i is None:
+            return
+        p = self.plan[i]
+        from tkinter import simpledialog
+        new_name = simpledialog.askstring("编辑新名", f"原名：{p['old_name']}", initialvalue=p["new_name"])
+        if new_name is None:
+            return
+        parent = os.path.dirname(p["old_path"])
+        p["new_name"] = new_name
+        p["new_path"] = os.path.join(parent, new_name)
+        # 重算该行状态（简单判定：无变化/冲突/将改）
+        if not new_name or new_name == p["old_name"]:
+            p["status"] = ST_NOCHANGE
+        elif os.path.exists(p["new_path"]) and os.path.normcase(p["new_path"]) != os.path.normcase(p["old_path"]):
+            p["status"] = ST_CONFLICT
+        else:
+            p["status"] = ST_RENAME
+        tag_map = {ST_RENAME: "rename", ST_NOCHANGE: "nochange",
+                   ST_CONFLICT: "skip", ST_DUP: "skip"}
+        self.tree.item(iid, values=(p["old_name"], p["new_name"], p["status"], p["old_path"]),
+                       tags=(tag_map[p["status"]],))
 
     def _execute(self):
         if not self.plan:
@@ -800,8 +978,25 @@ class App(_BaseTk):
         if restored == 0 and failed == 0:
             messagebox.showinfo("提示", "没有可撤销的记录")
             return
-        messagebox.showinfo("撤销完成", f"恢复 {restored} 项，失败 {failed} 项。")
-        self.status_lbl.config(text=f"已撤销：恢复 {restored}，失败 {failed}。")
+        left = undo_depth()
+        messagebox.showinfo("撤销完成", f"恢复 {restored} 项，失败 {failed} 项。剩余可撤销 {left} 批。")
+        self.status_lbl.config(text=f"已撤销：恢复 {restored}，失败 {failed}。剩余可撤销 {left} 批。")
+
+    # -- 输入树右键移除 -----------------------------------------------------
+    def _on_src_rclick(self, event):
+        iid = self.src.identify_row(event.y)
+        if not iid or iid not in self._root_iids:
+            return  # 只允许移除顶层根项
+        path = self._node_path.get(iid)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label=f"移除：{os.path.basename(path) or path}",
+                         command=lambda: self._remove_root(path))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _remove_root(self, path):
+        self.roots = [r for r in self.roots if r != path]
+        self._refresh_drop()
+        self._schedule_preview()
 
 
 if __name__ == "__main__":
